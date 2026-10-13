@@ -13,7 +13,6 @@ from datetime import date, datetime, timedelta
 
 MODEL_FILE = "focusai_best_model.pkl"
 FALLBACK_MODEL_FILE = "focusai_tuned_model.pkl"
-REWARDS_FILE = "focusai_daily_rewards.json"
 
 st.set_page_config(
     page_title="FocusAI",
@@ -22,30 +21,132 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ============================================================
-# DAILY REWARD STORAGE (persists across refreshes/restarts)
-# ============================================================
 
-def load_daily_rewards():
+# ============================================================
+# ACCOUNT + CLOUD STORAGE (Supabase)
+# ============================================================
+import hashlib
+import hmac
+import secrets
+from supabase import create_client
+
+def get_supabase_client():
+    """Read server-side credentials from Streamlit secrets only."""
     try:
-        if os.path.exists(REWARDS_FILE):
-            with open(REWARDS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        return None
+
+def hash_pin(pin, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), bytes.fromhex(salt), 300_000).hex()
+    return f"{salt}${digest}"
+
+def verify_pin(pin, stored):
+    try:
+        salt, expected = stored.split("$", 1)
+        actual = hash_pin(pin, salt).split("$", 1)[1]
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def account_screen():
+    db = get_supabase_client()
+    st.title("🧠 FocusAI")
+    st.subheader("Your own account. Your own points. Your own progress.")
+    if db is None:
+        st.error("Cloud database is not configured yet. Follow the setup guide to add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Cloud → Settings → Secrets.")
+        st.stop()
+    mode = st.radio("", ["Log in", "Create account"], horizontal=True, key="account_mode")
+    with st.form("focusai_account_form", clear_on_submit=False):
+        username = st.text_input("Username", max_chars=24, help="Use 3–24 letters, numbers, or underscores.").strip().lower()
+        pin = st.text_input("6-digit PIN", type="password", max_chars=6)
+        pin2 = ""
+        if mode == "Create account":
+            pin2 = st.text_input("Confirm 6-digit PIN", type="password", max_chars=6)
+        submitted = st.form_submit_button("Create my account" if mode == "Create account" else "Log in", use_container_width=True)
+    if submitted:
+        import re
+        if not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+            st.error("Username must be 3–24 characters using only letters, numbers, and underscores.")
+            st.stop()
+        if not re.fullmatch(r"[0-9]{6}", pin):
+            st.error("Please enter a 6-digit numeric PIN.")
+            st.stop()
+        try:
+            if mode == "Create account":
+                if pin != pin2:
+                    st.error("The PINs do not match.")
+                    st.stop()
+                result = db.table("focusai_users").insert({
+                    "username": username, "pin_hash": hash_pin(pin), "user_data": {}
+                }).execute()
+                if not result.data:
+                    st.error("Account could not be created. Please try another username.")
+                    st.stop()
+                row = result.data[0]
+            else:
+                result = db.table("focusai_users").select("id,username,pin_hash,user_data").eq("username", username).limit(1).execute()
+                row = result.data[0] if result.data else None
+                if not row or not verify_pin(pin, row.get("pin_hash", "")):
+                    st.error("Incorrect username or PIN.")
+                    st.stop()
+            st.session_state.auth_user_id = row["id"]
+            st.session_state.auth_username = row["username"]
+            st.session_state.auth_loaded = False
+            st.session_state._just_logged_in_data = row.get("user_data") or {}
+            st.rerun()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "duplicate" in msg or "unique" in msg:
+                st.error("That username is already taken. Choose another one.")
+            else:
+                st.error("Could not connect to the account database. Check the Supabase setup and try again.")
+    st.caption("Use a unique PIN and don't reuse a PIN you use for anything important. This school-project login is not intended for sensitive information.")
+    st.stop()
+
+# Require a signed-in account before showing any student data.
+if not st.session_state.get("auth_user_id"):
+    account_screen()
+
+# Load this account's saved data once per login.
+if not st.session_state.get("auth_loaded", False):
+    saved = st.session_state.pop("_just_logged_in_data", {})
+    for _key in ("tasks", "study_log", "daily_rewards", "completed_sessions", "challenge_completed_date"):
+        if _key in saved:
+            st.session_state[_key] = saved[_key]
+    st.session_state.auth_loaded = True
+
+def save_user_data():
+    """Persist only the signed-in user's app data to their own database row."""
+    if not st.session_state.get("auth_user_id") or not st.session_state.get("auth_loaded"):
+        return
+    db = get_supabase_client()
+    if db is None:
+        return
+    data = {key: st.session_state.get(key) for key in (
+        "tasks", "study_log", "daily_rewards", "completed_sessions", "challenge_completed_date"
+    )}
+    # Streamlit/Python dates are normalized to strings for JSON storage.
+    data["study_log"] = {str(k): int(v) for k, v in (data.get("study_log") or {}).items()}
+    try:
+        db.table("focusai_users").update({"user_data": data}).eq("id", st.session_state.auth_user_id).execute()
+    except Exception:
+        st.warning("Your latest changes may not have synced to the cloud. Check your internet/database connection.")
 
 
-def save_daily_rewards(data):
-    temp_file = REWARDS_FILE + ".tmp"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(temp_file, REWARDS_FILE)
-
+# ============================================================
+# DAILY REWARD STORAGE (per signed-in account)
+# ============================================================
 
 def award_points(points, reason, day=None):
-    """Add points to the selected calendar day and persist them locally."""
+    """Add points to this visitor's Streamlit session only.
+
+    Do not use a shared JSON file here: on a hosted app, a shared file would
+    mix reward balances between different visitors.
+    """
     points = int(points)
     if points <= 0:
         return
@@ -58,8 +159,9 @@ def award_points(points, reason, day=None):
         "points": points,
         "reason": reason,
     })
-    save_daily_rewards(ledger)
-    st.session_state.focus_points = int(ledger.get(date.today().isoformat(), {}).get("total", 0))
+    st.session_state.focus_points = int(
+        ledger.get(date.today().isoformat(), {}).get("total", 0)
+    )
 
 
 # ============================================================
@@ -83,7 +185,7 @@ defaults = {
     "completed_sessions": 0,
     "session_message": None,
     "focus_points": 0,
-    "daily_rewards": load_daily_rewards(),
+    "daily_rewards": {},
     "challenge_completed_date": None,
     "calendar_month": date.today().replace(day=1),
 }
@@ -92,8 +194,16 @@ for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# Points shown in the header are always for today; older days remain in the ledger.
+# Points are loaded from this signed-in student's own saved ledger.
 st.session_state.focus_points = int(st.session_state.daily_rewards.get(date.today().isoformat(), {}).get("total", 0))
+
+with st.sidebar:
+    st.caption(f"Signed in as **{st.session_state.auth_username}**")
+    if st.button("Log out", use_container_width=True):
+        save_user_data()
+        for _key in list(st.session_state.keys()):
+            del st.session_state[_key]
+        st.rerun()
 
 # ============================================================
 # MODEL
@@ -415,7 +525,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Reward points are kept for this app session.
+# Reward points are isolated to this visitor session.
 st.markdown(
     f"""
     <div class="rewards-banner">
@@ -1037,8 +1147,7 @@ with tab3:
             horizontal=True
         )
 
-        custom_subject_option = "✏️ Enter a subject or task..."
-        selected_task_names = ["General study", custom_subject_option] + [
+        selected_task_names = ["General study"] + [
             t["task"]
             for t in st.session_state.tasks
             if not t["completed"]
@@ -1046,35 +1155,15 @@ with tab3:
 
         selected_task = st.selectbox(
             "What are you working on?",
-            selected_task_names,
-            key="focus_timer_task_choice",
-            help="Choose one of your existing tasks or enter any subject yourself."
+            selected_task_names
         )
-
-        custom_subject = ""
-        if selected_task == custom_subject_option:
-            custom_subject = st.text_input(
-                "Enter your subject or task",
-                placeholder="e.g. Physics, Electrostatics, Chemistry, Maths...",
-                key="focus_timer_custom_subject",
-                max_chars=100
-            ).strip()
-            if custom_subject:
-                st.caption(f"Your focus session will be for: **{custom_subject}**")
 
         if st.button(
             f"▶️ Start {duration}-minute Focus Session",
             use_container_width=True,
             type="primary"
         ):
-            if selected_task == custom_subject_option:
-                if not custom_subject:
-                    st.warning("Please enter a subject or task before starting the timer.")
-                    st.stop()
-                task_name = custom_subject
-            else:
-                task_name = None if selected_task == "General study" else selected_task
-
+            task_name = None if selected_task == "General study" else selected_task
             start_focus(duration, task_name)
             st.rerun()
 
@@ -1235,7 +1324,7 @@ with tab5:
     with reward_col3:
         all_time_points = sum(int(v.get("total", 0)) for v in st.session_state.daily_rewards.values())
         st.metric("🌟 All-time points", all_time_points)
-    st.caption("Today's points reset to 0 at the start of a new day. Previous days remain saved in your local rewards history.")
+    st.caption("Points are private to this browser session and are not shared with other visitors. They may reset when this session ends or the app restarts.")
     with st.expander("📅 Daily points history", expanded=False):
         history_rows = []
         for day_key, entry in sorted(st.session_state.daily_rewards.items(), reverse=True):
@@ -1374,3 +1463,6 @@ st.caption(
     "FocusAI • Student productivity assistant • "
     "Prediction + Tasks + Focus Timer + Calendar + Progress"
 )
+
+# Save this user's points, tasks and study history after each completed rerun.
+save_user_data()
