@@ -103,7 +103,7 @@ def account_screen():
             if "duplicate" in msg or "unique" in msg:
                 st.error("That username is already taken. Choose another one.")
             else:
-                st.error(f"Database error: {type(exc).__name__}: {str(exc)[:300]}")
+                st.error("Could not connect to the account database. Check the Supabase setup and try again.")
     st.caption("Use a unique PIN and don't reuse a PIN you use for anything important. This school-project login is not intended for sensitive information.")
     st.stop()
 
@@ -1151,21 +1151,38 @@ with tab3:
             t["task"]
             for t in st.session_state.tasks
             if not t["completed"]
-        ]
+        ] + ["✍️ Enter a subject manually"]
 
         selected_task = st.selectbox(
             "What are you working on?",
-            selected_task_names
+            selected_task_names,
+            key="focus_timer_task_choice"
         )
+        manual_subject = ""
+        if selected_task == "✍️ Enter a subject manually":
+            manual_subject = st.text_input(
+                "Enter your subject or topic",
+                placeholder="e.g. Physics — Ray Optics, Chemistry — Biomolecules",
+                max_chars=80,
+                key="focus_timer_manual_subject"
+            ).strip()
+            st.caption("This labels the session; it won't create a task in your task list.")
 
         if st.button(
             f"▶️ Start {duration}-minute Focus Session",
             use_container_width=True,
             type="primary"
         ):
-            task_name = None if selected_task == "General study" else selected_task
-            start_focus(duration, task_name)
-            st.rerun()
+            if selected_task == "✍️ Enter a subject manually":
+                if not manual_subject:
+                    st.warning("Enter a subject first, then start your session.")
+                else:
+                    start_focus(duration, manual_subject)
+                    st.rerun()
+            else:
+                task_name = None if selected_task == "General study" else selected_task
+                start_focus(duration, task_name)
+                st.rerun()
 
         st.divider()
 
@@ -1214,40 +1231,47 @@ with tab4:
                 st.session_state.calendar_month = date(year, month + 1, 1)
             st.rerun()
 
-    # Whole-month calendar grid, with each day's recorded hours shown in its cell.
+    # Responsive HTML calendar grid: keeps seven weekdays horizontal on phones.
     cal = calendar.Calendar(firstweekday=0)
     month_weeks = cal.monthdatescalendar(month_value.year, month_value.month)
-    weekday_cols = st.columns(7)
-    for col, weekday in zip(weekday_cols, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
-        col.markdown(f"**{weekday}**")
-
-    for week_index, week in enumerate(month_weeks):
-        day_cols = st.columns(7)
-        for col, day in zip(day_cols, week):
+    calendar_cells = []
+    for weekday in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        calendar_cells.append(
+            f"<div class='focusai-cal-weekday'>{weekday}</div>"
+        )
+    for week in month_weeks:
+        for day in week:
             is_current_month = day.month == month_value.month
             minutes = st.session_state.study_log.get(day.isoformat(), 0)
             hours = minutes / 60
             if not is_current_month:
-                col.markdown(
-                    f"<div style='min-height:84px;padding:8px;border:1px solid #e5e7eb;"
-                    f"border-radius:8px;opacity:0.35'><b>{day.day}</b><br> </div>",
-                    unsafe_allow_html=True
-                )
+                bg, border, opacity = "transparent", "#e5e7eb", "0.35"
+            elif minutes >= 180:
+                bg, border, opacity = "#dcfce7", ("#16a34a" if day == date.today() else "#86efac"), "1"
+            elif minutes > 0:
+                bg, border, opacity = "#dbeafe", ("#2563eb" if day == date.today() else "#93c5fd"), "1"
             else:
-                if minutes >= 180:
-                    bg = "#dcfce7"
-                elif minutes > 0:
-                    bg = "#dbeafe"
-                else:
-                    bg = "#f3f4f6"
-                border = "#86efac" if day == date.today() else "#d1d5db"
-                col.markdown(
-                    f"<div style='min-height:84px;padding:8px;border:1px solid {border};"
-                    f"border-radius:8px;background:{bg};color:#1f2937'>"
-                    f"<b>{day.day}</b><br><span style='font-size:13px'>"
-                    f"{hours:.1f} study hr</span></div>",
-                    unsafe_allow_html=True
-                )
+                bg, border, opacity = "#f3f4f6", ("#6366f1" if day == date.today() else "#d1d5db"), "1"
+            hours_label = f"{hours:.1f}h" if minutes else "—"
+            calendar_cells.append(
+                f"<div class='focusai-cal-day' style='background:{bg};border-color:{border};opacity:{opacity}'>"
+                f"<span class='focusai-cal-number'>{day.day}</span>"
+                f"<span class='focusai-cal-hours'>{hours_label}</span></div>"
+            )
+    st.markdown("""
+    <style>
+    .focusai-calendar-grid {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px;width:100%;}
+    .focusai-cal-weekday {text-align:center;font-weight:700;font-size:clamp(10px,2.5vw,13px);padding:5px 0;min-width:0;}
+    .focusai-cal-day {box-sizing:border-box;min-width:0;min-height:66px;border:1px solid;border-radius:8px;padding:6px 5px;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:7px;color:#1f2937;}
+    .focusai-cal-number {font-weight:750;font-size:clamp(11px,2.8vw,15px);}
+    .focusai-cal-hours {font-size:clamp(9px,2.3vw,12px);white-space:nowrap;}
+    @media(max-width:600px) {.focusai-calendar-grid{gap:3px}.focusai-cal-day{min-height:52px;padding:5px 1px;border-radius:6px;gap:5px}.focusai-cal-weekday{font-size:10px}.focusai-cal-hours{font-size:9px}}
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown(
+        "<div class='focusai-calendar-grid'>" + "".join(calendar_cells) + "</div>",
+        unsafe_allow_html=True
+    )
 
     month_total = sum(
         minutes for key, minutes in st.session_state.study_log.items()
