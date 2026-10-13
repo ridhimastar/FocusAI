@@ -3,5 +3,7 @@ pandas
 joblib
 scikit-learn==1.6.1
 openpyxl
+supabase>=2.6.0
+
 
 
