@@ -103,7 +103,7 @@ def account_screen():
             if "duplicate" in msg or "unique" in msg:
                 st.error("That username is already taken. Choose another one.")
             else:
-                st.error("Could not connect to the account database. Check the Supabase setup and try again.")
+                st.error(f"Database error: {type(exc).__name__}: {str(exc)[:300]}")
     st.caption("Use a unique PIN and don't reuse a PIN you use for anything important. This school-project login is not intended for sensitive information.")
     st.stop()
 
